@@ -1,0 +1,234 @@
+***** SERVICES REQUIRED*****
+
+AZURE DATA FACTORY
+AZURE DATABRICKS
+AZURE SYNAPSE ANALYTICS
+AZUE LAKE GEN2
+AZURE KEY VAUT
+
+SOURCE ------- MICROSOFT SQL SERVER
+
+***SOURCE FILE CONVERTED FROM BAK FORMAT******
+
+-----need to restore the ".bak" file to a database in a database management system which is MSSQL for the bak file
+
+
+*****TO CREATE A USER AND LOGIN FOR SQL DATABASE *****
+
+create login bharath with password ='bharath1531';
+
+create user bharath for login bharath
+
+-----USER IS CREATED AND WE CAN GIVE THE PERMISSION FOE THE USER UNDER SECURITY--LOGINS--bharath--PROPERTIES--USERMAPPING--GIVE PERMISSION----
+-----SERVER ROLE SHOULD BE SELECTED AS SYS ADMIN INORDER TO CONNECT TO THE DATA FACTORY AS SOURCE OR ELSE CONNECTION GETS FAILED-----
+
+
+******KEY VAULT*****
+
+user name and password can be protected with the AZURE KEY VAULT SERVICES
+PERMISSION MODEL SHOULD BE VAULT ACCESS 
+
+
+****AZURE DATA FACTORY****
+
+SELF HOSTED INTEGRATION RUNTIME IS USED TO TRANSFER DATA FROM SQL SERVER TO CLOUD PLATFORM 
+PIPELINE IS CREATED WITH SOURCE AS SQL SRVER AND AZURE DATA LAKE GEN2 AS SINK
+
+
+*****COPY A SINGLE TABLE FROM THE SQL SERVER DATABASE******
+
+--create a pipeline
+--create source with linked service as sql server which contains data
+--self integration run time is used for connection from the sq server
+--servername,username and database name are provided for the connection 
+--if required keyvault can be used to store passwords for sql server authentication
+--test the connection before creating a source
+--sink the azure blob storage 
+
+
+****COPY ALL THE TABLE IN THE DATABASE AT A TIME*****
+
+LOOKUP ACTIVITY
+
+--lookup acivity is used to get all the tables from the source database in sql server
+--query used to get all the tables from database--
+
+select 
+s.name as SchemaName,
+t.name as TableName
+from sys.tables t
+inner join sys.schemas s
+ON t.schema_id=s.schema_id
+where s.name ='SalesLT'
+
+--remove first row as header to display all the tables
+
+FOR EACH ACTIVITY
+
+--it is used to get all the values from the each table 
+
+---@activity('Look_all_tables').output.value is used to look for all the values in the table
+
+--inside the activities in for each item,copy activty is performed to copy all the tables with data from the source to sink
+
+--in copy activity source is connected along with query as 
+@{concat('select * from ',item().SchemaName,'.',item().TableName)} 
+This expression will generate a SQL query that selects all columns (*) from a table specified by the SchemaName and TableName
+
+--in the sink,two parameters are added as TableName and SchemeName with dataset properties as
+@item().TableName and @item().SchemaName should be mentioned
+
+--in the sink connection properties,blob storage folder is selected to copy the data from source
+directory --@{concat(dataset().SchemaName,'/',dataset().TableName)}
+filename --@{concat(dataset().TableName,'.csv')}
+above are the query used to create the required folder structure
+
+
+***AZURE DATABRICKS ******
+
+--Create a compute source(cluster) to process the data
+
+--Create a notebook such as storagemount,bronze_silver and silver_gold
+
+STORAGE MOUNT NOTEBOOK:
+
+--Create a mount point inorder to access our data from data lake
+
+configs = {
+  "fs.azure.account.auth.type": "CustomAccessToken",
+  "fs.azure.account.custom.token.provider.class": spark.conf.get("spark.databricks.passthrough.adls.gen2.tokenProviderClassName")
+}
+
+# Optionally, you can add <directory-name> to the source URI of your mount point.
+dbutils.fs.mount(
+  source = "abfss://bronze@studentbs1.dfs.core.windows.net/",
+  mount_point = "/mnt/bronze",
+  extra_configs = configs)
+  
+  bronze-container name
+  studentbs1-storage account name
+  
+ --dbutils.fs.ls('/mnt/bronze/SalesLT/') --to lis the all the available tables in the mounted bronze container
+ 
+ -- Address table is stored as 
+    input_path='/mnt/bronze/SalesLT/Address/Address.csv'
+	
+ --To read data from input_path
+   df=spark.read.format('csv').option("header","true").load(input_path)
+   
+ --To display the data stored as df
+   display(df)
+  
+  
+---To modify the date column in the address table:
+
+from pyspark.sql.functions import from_utc_timestamp,date_format
+from pyspark.sql.types import TimestampType
+
+df =df.withColumn("ModifiedDate",date_format(from_utc_timestamp(df["ModifiedDate"].cast(TimestampType()),"UTC"),"yyyy-MM-dd"))
+
+
+--check each column and load the data in the mentioned path
+
+for i in table_name:
+    path ='/mnt/bronze/SalesLT/' + i + '/' + i + '.csv'
+    df =spark.read.format('csv').load(path)
+    column =df.columns
+
+    for col in column:
+        if "Date" in col or "date" in col:
+            df = df.withColumn(col,date_format(from_utc_timestamp(df[col].cast(TimestampType()),"UTC"), 
+                   "yyyy-MM-dd"))
+
+
+output_path='/mnt/silver/SalesLT/' +i +'/'
+df.write.format('delta').mode("overwrite").save(output_path)
+
+
+--Data transformation for all the tables and load the transformed data into gold container in the azure data lake
+
+table_name=[]
+
+for i in dbutils.fs.ls('/mnt/bronze/SalesLT/'):
+     table_name.append(i.name.split('/')[0])
+	 
+	 
+from pyspark.sql.functions import from_utc_timestamp,date_format
+from pyspark.sql.types import TimestampType
+
+for i in table_name:
+    path ='/mnt/bronze/SalesLT/' + i + '/' + i + '.csv'
+    df =spark.read.format('csv').option('mergeSchema','true').option('header','true').load(path)
+    column =df.columns
+
+    for col in column:
+        if "Date" in col or "date" in col:
+            df = df.withColumn(col,date_format(from_utc_timestamp(df[col].cast(TimestampType()),"UTC"), "yyyy-MM-dd"))
+
+    output_path='/mnt/silver/SalesLT/' +i +'/'
+    df.write.format('delta').mode("overwrite").option('overwriteSchema','true').save(output_path)
+	
+	
+TO COPY THE TRANSFORMED DATA FORM SILVER AND NEEDS TO DO SOME CHANGES AND LOAD TO GOLD CONTAINR
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col,regexp_replace
+
+column_names=df.columns
+
+for old_col_name in column_names:
+    new_col_name ="".join(["_"+char if char.isupper() and not old_col_name[i -1].isupper() else char for i,char in enumerate(old_col_name)]).lstrip("_")
+
+    df =df.withColumnRenamed(old_col_name,new_col_name)
+	
+
+Data transformation for all table in the silver container
+
+table_name=[]
+
+for i in dbutils.fs.ls('/mnt/silver/SalesLT/'):
+     table_name.append(i.name.split('/')[0])
+	 
+	 
+  
+ for name in table_name:
+    path='/mnt/silver/SalesLT/' + name
+    print(path)
+    df = spark.read.format('delta').load(path)
+
+    column_names =df.columns
+
+    for old_col_name in column_names:
+        new_col_name ="".join(["_"+char if char.isupper() and not old_col_name[i -1].isupper() else char for i,char in enumerate(old_col_name)]).lstrip("_")
+
+        df =df.withColumnRenamed(old_col_name,new_col_name)
+
+    output_path ='/mnt/gold/SaesLT/' + name + '/'
+    df.write.format('delta').mode('overwrite').save(output_path)
+	
+	delata format is used inorder to get the latest updated data which is loaded in the database
+
+
+
+TO connect azure data bricks as linked service access token is req
+uired which is available in azure databricks user settings
+
+
+AZURE SYNPASE ANALYTICS
+
+---Create a serverless pool in the azure synapse analytics
+---Linked service is directly created while creating azure synpase analytics to access the transformed data which is stored 
+   in gold container of Azure Data Lake Gen2
+---Individual view is created for each table in the database inorder to access the data easily
+   
+
+
+AZURE DATABRICKS ACCESS TOKE -- dapi76c34a62dea550b69ea85ef0d5399245-3
+
+
+
+
+
+
+
+
